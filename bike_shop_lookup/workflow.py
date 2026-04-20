@@ -1,51 +1,63 @@
+"""Row-by-row website lookup orchestration."""
 import glob
 import os
+from typing import Optional
 
 from .csv_io import OutputWriter, load_processed_keys, read_input_rows, row_key
-from .search import find_website
+from .search import PlaywrightSearcher
 
-DEFAULT_INPUT = "data/Search email by KVK - Sheet1.csv"
+DEFAULT_INPUT = "data/input.csv"
 DEFAULT_OUTPUT = "data/output.csv"
-INPUT_FALLBACK_GLOB = "data/Search email by KVK - Sheet1*.csv"
+INPUT_FALLBACK_GLOBS = (
+    "data/*.csv",
+)
 
 
 def resolve_input_path(path: str) -> str:
-    """Return the given path if it exists, otherwise fall back to any
-    ``Search email by KVK - Sheet1*.csv`` match under ``data/``."""
+    """Return ``path`` if it exists; otherwise fall back to any CSV under data/."""
     if os.path.exists(path):
         return path
-    matches = sorted(glob.glob(INPUT_FALLBACK_GLOB))
-    if matches:
-        return matches[0]
-    return path  # let the caller raise a clear FileNotFoundError
+    for pattern in INPUT_FALLBACK_GLOBS:
+        matches = sorted(p for p in glob.glob(pattern) if os.path.basename(p) != "output.csv")
+        if matches:
+            return matches[0]
+    return path
 
 
-def process_row(row: dict) -> dict:
-    result = find_website(
-        short_name=row.get("short_name", ""),
-        city=row.get("city", ""),
-        postal_code=row.get("postal_code", ""),
-    )
-    return {**row, **result}
-
-
-def run(input_path: str = DEFAULT_INPUT, output_path: str = DEFAULT_OUTPUT) -> None:
+def run(
+    input_path: str = DEFAULT_INPUT,
+    output_path: str = DEFAULT_OUTPUT,
+    limit: Optional[int] = 10,
+    headless: bool = True,
+) -> None:
     input_path = resolve_input_path(input_path)
-    print(f"Reading {input_path}")
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Input CSV not found: {input_path}")
 
+    print(f"Reading {input_path}")
     processed = load_processed_keys(output_path)
     if processed:
         print(f"Resuming: {len(processed)} row(s) already in {output_path}")
 
-    with OutputWriter(output_path) as writer:
+    written = 0
+    with OutputWriter(output_path) as writer, PlaywrightSearcher(headless=headless) as searcher:
         for i, row in enumerate(read_input_rows(input_path), start=1):
-            key = row_key(row)
-            if key in processed:
+            if limit is not None and written >= limit:
+                print(f"Reached limit of {limit} new rows — stopping.")
+                break
+            if row_key(row) in processed:
                 continue
 
-            enriched = process_row(row)
+            result = searcher.find_website(
+                business_name=row.get("business_name", ""),
+                postal_code=row.get("postal_code", ""),
+            )
+            enriched = {**row, **result}
             writer.write(enriched)
+            written += 1
 
-            label = row.get("short_name") or "?"
+            label = row.get("business_name") or "?"
             note = enriched.get("notes") or "ok"
             print(f"[{i}] {label}: {enriched.get('domain') or '-'} ({note})")
+
+    print(f"Done. Wrote {written} new row(s) to {output_path}.")
